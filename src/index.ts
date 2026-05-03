@@ -30,9 +30,9 @@ const cli = yargs(hideBin(process.argv))
   })
   .option("partition", {
     type: "number",
-    demandOption: true,
-    default: process.env.KAFKA_PARTITION,
-    describe: "Kafka partition to consume",
+    demandOption: false,
+    default: process.env.KAFKA_PARTITION ? Number(process.env.KAFKA_PARTITION) : undefined,
+    describe: "Kafka partition to consume (or KAFKA_PARTITION env)",
   })
   .option("key", {
     type: "string",
@@ -140,9 +140,10 @@ async function main(): Promise<void> {
   }
   const topicName = args.topic;
 
-  if (!Number.isInteger(args.partition) || args.partition < 0) {
-    throw new Error("--partition must be a non-negative integer");
+  if (args.partition === undefined || !Number.isInteger(args.partition) || args.partition < 0) {
+    throw new Error("--partition (or KAFKA_PARTITION env) must be a non-negative integer");
   }
+  const partition: number = args.partition;
 
   if (!Number.isFinite(args["chunk-size-mb"]) || args["chunk-size-mb"] <= 0) {
     throw new Error("--chunk-size-mb must be a positive number");
@@ -279,10 +280,10 @@ async function main(): Promise<void> {
     .filter((x) => Number.isInteger(x))
     .sort((a, b) => a - b);
 
-  if (!availablePartitions.includes(args.partition)) {
+  if (!availablePartitions.includes(partition)) {
     throw new Error(
       [
-        `Requested partition ${args.partition} is not available for topic ${args.topic}.`,
+        `Requested partition ${partition} is not available for topic ${args.topic}.`,
         `Available partitions: [${availablePartitions.join(", ")}]`,
       ].join(" "),
     );
@@ -298,14 +299,14 @@ async function main(): Promise<void> {
 
   consumer.on(consumer.events.GROUP_JOIN, (event) => {
     const assigned = event.payload.memberAssignment[topicName] ?? [];
-    const hasRequestedPartition = assigned.includes(args.partition);
+    const hasRequestedPartition = assigned.includes(partition);
     console.log(
       `Group assignment for ${topicName}: [${assigned.join(", ")}]`,
     );
     if (!hasRequestedPartition) {
       console.warn(
         [
-          `This consumer was not assigned requested partition ${args.partition}.`,
+          `This consumer was not assigned requested partition ${partition}.`,
           "Use a dedicated --group-id (or stop other consumers in same group).",
         ].join(" "),
       );
@@ -351,7 +352,7 @@ async function main(): Promise<void> {
       `instanceId=${instanceId}`,
       `queue=${queueName}`,
       `topic=${args.topic}`,
-      `partition=${args.partition}`,
+      `partition=${partition}`,
       `key=${args.key ?? "(any)"}`,
       `groupId=${args["group-id"]}`,
       `commit=${args.commit ? "on" : "off"}`,
@@ -386,12 +387,12 @@ async function main(): Promise<void> {
     autoCommit: false,
     eachMessage: async ({
       topic,
-      partition,
+      partition: msgPartition,
       message,
       heartbeat,
       pause,
     }): Promise<void> => {
-      if (partition !== args.partition) {
+      if (msgPartition !== partition) {
         pause();
         await heartbeat();
         return;
@@ -401,7 +402,7 @@ async function main(): Promise<void> {
 
       if (typeof args.key === "string") {
         if (rawKey !== args.key) {
-          await commitProcessedOffset(topic, partition, message.offset);
+          await commitProcessedOffset(topic, msgPartition, message.offset);
           return;
         }
       }
@@ -411,12 +412,12 @@ async function main(): Promise<void> {
         console.warn(
           `Skipping message at offset ${message.offset}: key "${rawKey}" does not match sessionId:userId format`,
         );
-        await commitProcessedOffset(topic, partition, message.offset);
+        await commitProcessedOffset(topic, msgPartition, message.offset);
         return;
       }
 
       if (!message.value) {
-        await commitProcessedOffset(topic, partition, message.offset);
+        await commitProcessedOffset(topic, msgPartition, message.offset);
         return;
       }
 
@@ -428,7 +429,7 @@ async function main(): Promise<void> {
           `Skipping non-JSON message at offset ${message.offset}:`,
           error,
         );
-        await commitProcessedOffset(topic, partition, message.offset);
+        await commitProcessedOffset(topic, msgPartition, message.offset);
         return;
       }
 
@@ -436,7 +437,7 @@ async function main(): Promise<void> {
         console.warn(
           `Skipping message with invalid packet.payload at offset ${message.offset}`,
         );
-        await commitProcessedOffset(topic, partition, message.offset);
+        await commitProcessedOffset(topic, msgPartition, message.offset);
         return;
       }
 
@@ -453,7 +454,7 @@ async function main(): Promise<void> {
         }
       }
       if (invalidByteFound) {
-        await commitProcessedOffset(topic, partition, message.offset);
+        await commitProcessedOffset(topic, msgPartition, message.offset);
         return;
       }
 
@@ -461,7 +462,7 @@ async function main(): Promise<void> {
         console.warn(
           `Skipping message at offset ${message.offset}: unixTimestamp missing or not finite`,
         );
-        await commitProcessedOffset(topic, partition, message.offset);
+        await commitProcessedOffset(topic, msgPartition, message.offset);
         return;
       }
 
@@ -469,7 +470,7 @@ async function main(): Promise<void> {
         console.warn(
           `Skipping message at offset ${message.offset}: packet.sequenceNumber missing or not integer`,
         );
-        await commitProcessedOffset(topic, partition, message.offset);
+        await commitProcessedOffset(topic, msgPartition, message.offset);
         return;
       }
 
@@ -512,7 +513,7 @@ async function main(): Promise<void> {
         await entry.writer.write(bytes, parsed.unixTimestamp);
       }
 
-      await commitProcessedOffset(topic, partition, message.offset);
+      await commitProcessedOffset(topic, msgPartition, message.offset);
 
       await heartbeat();
     },
