@@ -1,22 +1,20 @@
-import { existsSync, mkdirSync } from "node:fs";
+import { mkdirSync } from "node:fs";
 import { writeFile } from "node:fs/promises";
 import path from "node:path";
 import { spawn } from "node:child_process";
 import ffmpegStatic from "ffmpeg-static";
 
-function timestampToFileSegment(ts: number): string {
-  return String(ts).replace(/-/g, "x").replace(/\./g, "p");
-}
-
 export type ChunkResult = {
   localPath: string;
   s3Key: string;
+  anchorUnixTimestampMs: number;
 };
 
 export type ChunkWriterOptions = {
   baseOutputDir: string;
   sessionId: string;
   userId: string;
+  trackId: string;
   chunkSizeBytes: number;
   fileExtension?: string;
   sampleFormat?: string;
@@ -34,7 +32,6 @@ export class ChunkWriter {
   private readonly sampleRate: number;
   private readonly channels: number;
   private readonly onChunkReady?: (result: ChunkResult) => void;
-  private chunkIndex = 1;
   private currentChunk = Buffer.alloc(0);
   private currentChunkLabelTimestamp: number | null = null;
   private pendingWrite = Promise.resolve();
@@ -47,15 +44,23 @@ export class ChunkWriter {
     this.channels = opts.channels ?? 1;
     this.onChunkReady = opts.onChunkReady;
 
-    this.localDir = path.join(opts.baseOutputDir, opts.sessionId, opts.userId);
-    this.s3Prefix = `${opts.sessionId}/${opts.userId}`;
+    this.localDir = path.join(
+      opts.baseOutputDir,
+      opts.sessionId,
+      opts.userId,
+      opts.trackId,
+    );
+    this.s3Prefix = `${opts.sessionId}/${opts.userId}/${opts.trackId}`;
 
-    if (!existsSync(this.localDir)) {
-      mkdirSync(this.localDir, { recursive: true });
-    }
+    this.ensureLocalDir();
   }
 
-  write(buffer: Buffer, packetTimestamp: number): Promise<void> {
+  /** (Re)create output dir — upload pruning may remove it while this writer stays open. */
+  private ensureLocalDir(): void {
+    mkdirSync(this.localDir, { recursive: true });
+  }
+
+  write(buffer: Buffer, packetTimestampMs: number): Promise<void> {
     if (buffer.length === 0) {
       return this.pendingWrite;
     }
@@ -64,7 +69,7 @@ export class ChunkWriter {
       let cursor = 0;
       while (cursor < buffer.length) {
         if (this.currentChunk.length === 0) {
-          this.currentChunkLabelTimestamp = packetTimestamp;
+          this.currentChunkLabelTimestamp = packetTimestampMs;
         }
 
         const remainingInChunk = this.chunkSizeBytes - this.currentChunk.length;
@@ -107,24 +112,28 @@ export class ChunkWriter {
       throw new Error("internal: chunk flush without packet.timestamp");
     }
 
-    const ts = this.currentChunkLabelTimestamp;
+    const anchorUnixTimestampMs = this.currentChunkLabelTimestamp;
     this.currentChunkLabelTimestamp = null;
 
-    const tsSeg = timestampToFileSegment(ts);
-    const fileName = `${tsSeg}-${this.chunkIndex.toString().padStart(6, "0")}.${this.fileExtension}`;
+    const { v7: uuidv7 } = await import("uuid");
+    const fileName = `${uuidv7()}.${this.fileExtension}`;
     const localPath = path.join(this.localDir, fileName);
     const s3Key = `${this.s3Prefix}/${fileName}`;
 
     const opusData = await this.convertPcmToOpus(chunkData);
+    this.ensureLocalDir();
     await writeFile(localPath, opusData);
-    this.chunkIndex += 1;
 
-    this.onChunkReady?.({ localPath, s3Key });
+    this.onChunkReady?.({
+      localPath,
+      s3Key,
+      anchorUnixTimestampMs,
+    });
   }
 
   private convertPcmToOpus(pcmData: Buffer): Promise<Buffer> {
     return new Promise((resolve, reject) => {
-      const ffmpegPath = ffmpegStatic ?? "ffmpeg";
+      const ffmpegPath = (ffmpegStatic as unknown as string | null) ?? "ffmpeg";
       const ffmpeg = spawn(ffmpegPath, [
         "-hide_banner",
         "-loglevel",

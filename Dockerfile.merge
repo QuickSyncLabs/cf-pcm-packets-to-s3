@@ -1,0 +1,42 @@
+# DB + S3 session merge (ffmpeg amix). CLI: merge-audio-chunks
+# Build: docker build -f Dockerfile.merge -t cf-merge .
+# Run:  docker run --rm cf-merge --session-id … --s3-bucket …
+FROM node:22-alpine AS deps
+WORKDIR /app
+COPY package.json package-lock.json ./
+COPY packages/db/package.json packages/db/package.json
+COPY packages/ingest/package.json packages/ingest/package.json
+COPY packages/merge/package.json packages/merge/package.json
+RUN npm ci --ignore-scripts
+RUN npm rebuild ffmpeg-static ffprobe-static
+
+FROM node:22-alpine AS build
+WORKDIR /app
+COPY --from=deps /app/node_modules ./node_modules
+COPY package.json package-lock.json ./
+COPY packages ./packages
+RUN npm run build -w @cf/db && npm run build -w @cf/merge
+
+FROM node:22-alpine AS prod-deps
+WORKDIR /app
+COPY package.json package-lock.json ./
+COPY packages/db/package.json packages/db/package.json
+COPY packages/ingest/package.json packages/ingest/package.json
+COPY packages/merge/package.json packages/merge/package.json
+RUN npm ci --omit=dev --ignore-scripts
+RUN npm rebuild ffmpeg-static ffprobe-static
+
+FROM node:22-alpine
+RUN apk add --no-cache tini
+WORKDIR /app
+ENV NODE_ENV=production
+COPY --from=prod-deps /app/node_modules ./node_modules
+COPY --from=build /app/packages/db/dist ./packages/db/dist
+COPY --from=build /app/packages/db/prisma ./packages/db/prisma
+COPY --from=build /app/packages/merge/dist ./packages/merge/dist
+COPY package.json ./
+COPY packages/db/package.json packages/db/package.json
+COPY packages/merge/package.json packages/merge/package.json
+RUN mkdir -p /app/output/tmp && chown -R node:node /app/output
+USER node
+ENTRYPOINT ["/sbin/tini", "--", "node", "packages/merge/dist/mergeAudioChunks.js"]

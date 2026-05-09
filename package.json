@@ -1,35 +1,16 @@
 {
   "name": "cf-packet-to-s3",
-  "version": "1.0.0",
-  "description": "Kafka packet consumer that writes 5MB local chunks",
-  "main": "dist/index.js",
-  "scripts": {
-    "dev": "tsx src/index.ts",
-    "merge-opus": "tsx src/mergeOpus.ts",
-    "build": "tsc -p tsconfig.json",
-    "start": "node dist/index.js"
-  },
-  "keywords": [
-    "kafka",
-    "typescript",
-    "nodejs"
+  "private": true,
+  "description": "Monorepo: Kafka ingest (compress + upload) and DB-backed session merge (mix)",
+  "workspaces": [
+    "packages/*"
   ],
-  "author": "",
-  "license": "ISC",
-  "dependencies": {
-    "@aws-sdk/client-s3": "^3.1040.0",
-    "bullmq": "^5.76.4",
-    "dotenv": "^17.3.1",
-    "ffmpeg-static": "^5.3.0",
-    "ffprobe-static": "^3.1.0",
-    "ioredis": "^5.10.1",
-    "kafkajs": "^2.2.4",
-    "yargs": "^18.0.0"
+  "scripts": {
+    "postinstall": "npm run generate -w @cf/db",
+    "build": "npm run build -w @cf/db && npm run build -w @cf/ingest && npm run build -w @cf/merge",
+    "dev": "npm run dev -w @cf/ingest",
+    "merge-audio-chunks": "npm run merge-audio-chunks -w @cf/merge --",
+    "start": "npm run start -w @cf/ingest"
   },
-  "devDependencies": {
-    "@types/node": "^25.5.0",
-    "@types/yargs": "^17.0.35",
-    "tsx": "^4.21.0",
-    "typescript": "^5.9.3"
-  }
+  "license": "ISC"
 }

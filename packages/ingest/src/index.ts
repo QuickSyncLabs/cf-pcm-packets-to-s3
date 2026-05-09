@@ -1,14 +1,16 @@
-import "dotenv/config";
 import path from "node:path";
 import { Kafka, logLevel } from "kafkajs";
 import yargs from "yargs";
 import { hideBin } from "yargs/helpers";
 import { randomUUID } from "node:crypto";
 import { Queue } from "bullmq";
-import IORedis from "ioredis";
-import { ChunkWriter } from "./chunkWriter";
-import { createUploadWorker, type UploadJobData } from "./uploadWorker";
-import type { PacketDto } from "./types";
+import { Redis } from "ioredis";
+import { ChunkWriter, type ChunkResult } from "./chunkWriter.js";
+import { createUploadWorker, type UploadJobData } from "./uploadWorker.js";
+import type { PacketDto } from "./types.js";
+import { loadMonorepoEnv, runPrismaMigrateDeploy } from "@cf/db";
+
+loadMonorepoEnv();
 
 const ONE_MB = 1024 * 1024;
 const PCM_BYTES_PER_SAMPLE = 4;
@@ -119,21 +121,29 @@ function sanitizePathSegment(raw: string): string {
   return raw.replace(/[^a-zA-Z0-9._-]/g, "");
 }
 
-function parseKafkaKey(raw: string): { sessionId: string; userId: string } | null {
-  const sep = raw.indexOf(":");
-  if (sep < 1 || sep === raw.length - 1) {
+function parseKafkaKey(
+  raw: string,
+): { sessionId: string; userId: string; trackId: string } | null {
+  const parts = raw.split("::");
+  if (parts.length !== 3) {
     return null;
   }
-  const sessionId = sanitizePathSegment(raw.substring(0, sep));
-  const userId = sanitizePathSegment(raw.substring(sep + 1));
-  if (!sessionId || !userId) {
+  const sessionId = sanitizePathSegment(parts[0]!);
+  const userId = sanitizePathSegment(parts[1]!);
+  const trackId = sanitizePathSegment(parts[2]!);
+  if (!sessionId || !userId || !trackId) {
     return null;
   }
-  return { sessionId, userId };
+  return { sessionId, userId, trackId };
 }
 
 async function main(): Promise<void> {
   const args = await cli.parseAsync();
+
+  if (!process.env.DATABASE_URL) {
+    throw new Error("Missing DATABASE_URL (PostgreSQL connection string for Prisma)");
+  }
+  runPrismaMigrateDeploy();
 
   if (!args.topic) {
     throw new Error("Missing --topic (or KAFKA_TOPIC in environment)");
@@ -176,15 +186,19 @@ async function main(): Promise<void> {
   const instanceId = randomUUID();
   const queueName = `chunk-processor-${instanceId}`;
 
-  const redisConnection = new IORedis(args["redis-url"], {
+  const redisConnection = new Redis(args["redis-url"], {
     maxRetriesPerRequest: null,
   });
 
   const uploadQueue = new Queue<UploadJobData>(queueName, {
     connection: redisConnection,
+    defaultJobOptions: {
+      attempts: 6,
+      backoff: { type: "fixed", delay: 5000 },
+    },
   });
 
-  const uploadWorker = createUploadWorker({
+  const { worker: uploadWorker, prisma } = createUploadWorker({
     queueName,
     connection: redisConnection,
     s3Bucket: args["s3-bucket"],
@@ -198,55 +212,43 @@ async function main(): Promise<void> {
 
   const chunkSizeBytes = Math.floor(args["chunk-size-mb"] * ONE_MB);
 
-  const seqTtl = 3600;
-  const SEQ_KEY_PREFIX = "seq:";
-
-  async function getLastSequenceNumber(writerKey: string): Promise<number | null> {
-    const val = await redisConnection.get(`${SEQ_KEY_PREFIX}${writerKey}`);
-    if (val === null) {
-      return null;
-    }
-    const num = Number(val);
-    return Number.isInteger(num) ? num : null;
-  }
-
-  async function setLastSequenceNumber(writerKey: string, seq: number): Promise<void> {
-    await redisConnection.set(`${SEQ_KEY_PREFIX}${writerKey}`, String(seq), "EX", seqTtl);
-  }
-
   type WriterEntry = {
     writer: ChunkWriter;
     pendingPcmRemainder: Buffer;
-    lastSequenceNumber: number | null;
   };
 
   const writers = new Map<string, WriterEntry>();
 
-  function getOrCreateWriter(sessionId: string, userId: string): WriterEntry {
-    const writerKey = `${sessionId}:${userId}`;
+  function getOrCreateWriter(
+    sessionId: string,
+    userId: string,
+    trackId: string,
+  ): WriterEntry {
+    const writerKey = `${sessionId}:${userId}:${trackId}`;
     let entry = writers.get(writerKey);
     if (!entry) {
       const writer = new ChunkWriter({
         baseOutputDir,
         sessionId,
         userId,
+        trackId,
         chunkSizeBytes,
         fileExtension: "opus",
         sampleFormat: PCM_SAMPLE_FORMAT,
         sampleRate: args["pcm-sample-rate"],
         channels: args["pcm-channels"],
-        onChunkReady: (result) => {
-          const currentEntry = writers.get(writerKey);
-          if (currentEntry?.lastSequenceNumber !== null && currentEntry?.lastSequenceNumber !== undefined) {
-            void setLastSequenceNumber(writerKey, currentEntry.lastSequenceNumber);
-          }
+        onChunkReady: (result: ChunkResult) => {
           void uploadQueue.add("upload", {
             localPath: result.localPath,
-            s3Key: "recordings/" + result.s3Key,
+            s3Key: `recordings/${result.s3Key}`,
+            sessionId,
+            userId,
+            trackId,
+            anchorUnixTimestampMs: result.anchorUnixTimestampMs,
           });
         },
       });
-      entry = { writer, pendingPcmRemainder: Buffer.alloc(0), lastSequenceNumber: null };
+      entry = { writer, pendingPcmRemainder: Buffer.alloc(0) };
       writers.set(writerKey, entry);
     }
     return entry;
@@ -327,6 +329,7 @@ async function main(): Promise<void> {
         await entry.writer.close();
       }
       await uploadWorker.close();
+      await prisma.$disconnect();
       await uploadQueue.close();
       await redisConnection.quit();
     }
@@ -368,7 +371,7 @@ async function main(): Promise<void> {
 
   const commitProcessedOffset = async (
     topic: string,
-    partition: number,
+    partitionNum: number,
     offset: string,
   ): Promise<void> => {
     if (!args.commit) {
@@ -377,7 +380,7 @@ async function main(): Promise<void> {
     await consumer.commitOffsets([
       {
         topic,
-        partition,
+        partition: partitionNum,
         offset: (BigInt(offset) + 1n).toString(),
       },
     ]);
@@ -410,7 +413,7 @@ async function main(): Promise<void> {
       const parsedKey = parseKafkaKey(rawKey);
       if (!parsedKey) {
         console.warn(
-          `Skipping message at offset ${message.offset}: key "${rawKey}" does not match sessionId:userId format`,
+          `Skipping message at offset ${message.offset}: key "${rawKey}" does not match sessionId::userId::trackId format`,
         );
         await commitProcessedOffset(topic, msgPartition, message.offset);
         return;
@@ -466,34 +469,13 @@ async function main(): Promise<void> {
         return;
       }
 
-      if (!Number.isInteger(parsed.packet.sequenceNumber)) {
-        console.warn(
-          `Skipping message at offset ${message.offset}: packet.sequenceNumber missing or not integer`,
-        );
-        await commitProcessedOffset(topic, msgPartition, message.offset);
-        return;
-      }
+      const unixTimestampMs = parsed.unixTimestamp;
 
-      // console.log(
-      //   `received data | offset=${message.offset} key=${rawKey} seq=${parsed.packet.sequenceNumber} payloadBytes=${payload.length} unixTs=${parsed.unixTimestamp}`,
-      // );
-
-      const entry = getOrCreateWriter(parsedKey.sessionId, parsedKey.userId);
-      const writerKey = `${parsedKey.sessionId}:${parsedKey.userId}`;
-      const seq = parsed.packet.sequenceNumber;
-
-      if (entry.lastSequenceNumber === null) {
-        entry.lastSequenceNumber = await getLastSequenceNumber(writerKey);
-      }
-
-      if (entry.lastSequenceNumber !== null && seq !== entry.lastSequenceNumber + 1) {
-        console.log(
-          `Sequence gap for ${writerKey} (expected ${entry.lastSequenceNumber + 1}, got ${seq}). Flushing chunk as new segment.`,
-        );
-        entry.pendingPcmRemainder = Buffer.alloc(0);
-        await entry.writer.forceFlush();
-      }
-      entry.lastSequenceNumber = seq;
+      const entry = getOrCreateWriter(
+        parsedKey.sessionId,
+        parsedKey.userId,
+        parsedKey.trackId,
+      );
 
       let bytes = Buffer.from(payload);
 
@@ -510,7 +492,7 @@ async function main(): Promise<void> {
       }
 
       if (bytes.length > 0) {
-        await entry.writer.write(bytes, parsed.unixTimestamp);
+        await entry.writer.write(bytes, unixTimestampMs);
       }
 
       await commitProcessedOffset(topic, msgPartition, message.offset);

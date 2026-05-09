@@ -1,15 +1,20 @@
-# Kafka Packet Chunker (TypeScript)
+# cf-packet-to-s3 (monorepo)
 
-CLI app that:
-- consumes JSON `PacketDto` messages from Kafka,
-- listens for a specific partition,
-- reconstructs `packet.payload` as PCM stream (`s32le`, mono, 48kHz by default),
-- converts each chunk to OPUS,
-- writes local `.opus` files in 5 MB PCM-equivalent chunks.
+TypeScript workspaces:
+
+| Package | Path | Role |
+|--------|------|------|
+| **@cf/db** | `packages/db` | Prisma schema, migrations, `runPrismaMigrateDeploy()`, `PrismaClient` re-exports |
+| **@cf/ingest** | `packages/ingest` | Kafka consumer: PCM → OPUS chunks, BullMQ upload to S3 + `AudioChunksLog` rows |
+| **@cf/merge** | `packages/merge` | Session merge: read DB + S3, ffmpeg **amix** timeline, optional upload |
+
+From the **repo root**, `npm run dev`, `npm run build`, `npm run merge-audio-chunks`, and `npm start` delegate to the right workspace.
+
+On startup, ingest and merge call **`prisma migrate deploy`** (via `@cf/db`) unless `SKIP_PRISMA_MIGRATE=1`. Set **`DATABASE_URL`**. Migrations live under `packages/db/prisma/migrations/`. Override the Prisma project directory with **`PRISMA_PROJECT_ROOT`** if needed (default is `packages/db`).
 
 ## Data shape
 
-Expected Kafka message value (JSON):
+Expected Kafka message value (JSON). **`unixTimestamp`** must be **Unix time in milliseconds**. Message **key** must be `sessionId::userId::trackId` (segments sanitized). After a client restart, use a **new** `trackId` in the key so the merger can re-anchor and avoid timeline overlap when device timestamps reset.
 
 ```json
 {
@@ -19,63 +24,87 @@ Expected Kafka message value (JSON):
     "sequenceNumber": 27798,
     "timestamp": 3077091851,
     "payload": [244, 255, 244, 255]
-  }
+  },
+  "unixTimestamp": 1717764123456
 }
 ```
 
 ## Setup
 
-1. Use Node 22 (example with `nvs`):
-   - `nvs add 22`
-   - `nvs use 22`
-2. Install dependencies:
-   - `npm install`
-3. Optional env file:
-   - `cp .env.example .env`
-4. No system ffmpeg needed; app uses bundled `ffmpeg-static` dependency.
+1. Node 22 recommended.
+2. From repo root: `npm install` (runs `prisma generate` for `@cf/db`).
+3. Environment: see `.env.example` — **`DATABASE_URL`**, **`REDIS_URL`**, S3/AWS vars for ingest; merge needs **`DATABASE_URL`** and S3 read (and optional upload) credentials.
+4. No system ffmpeg required for ingest (`ffmpeg-static`). Merge uses `ffmpeg-static` + `ffprobe-static`.
 
-## Run (dev)
+## Run ingest (dev)
 
 ```bash
-npm run dev -- --topic packets-topic --partition 2 --key my-partition-key --brokers localhost:9092
+npm run dev -- --topic packets-topic --partition 2 --brokers localhost:9092 --s3-bucket my-bucket
 ```
 
-## Run (compiled)
+## Run ingest (compiled)
 
 ```bash
 npm run build
-npm start -- --topic packets-topic --partition 2 --key my-partition-key --brokers localhost:9092
+npm start -- --topic packets-topic --partition 2 --brokers localhost:9092 --s3-bucket my-bucket
 ```
 
-## Useful flags
+## Merge session from database + S3 (`merge-audio-chunks`)
+
+```bash
+npm run merge-audio-chunks -- --session-id mySession --s3-bucket my-bucket
+```
+
+The first **`--`** is required so npm passes the rest through to the merge CLI (without it, npm treats flags like `--session-id` as its own options and the CLI never sees them).
+
+Optional: `--upload-to-s3`, `--s3-output-key`, `--output merged.opus`, `--s3-region`, `--s3-endpoint`.
+
+## Per-package scripts
+
+- `packages/ingest`: `npm run dev` / `npm run build` / `npm start`
+- `packages/merge`: `npm run merge-audio-chunks` / `npm run start` (compiled) / `npm run build`
+- `packages/db`: `npm run generate` / `npm run migrate-deploy`
+
+## Useful flags (ingest)
 
 - `--partition` (required): partition to process
-- `--key`: Kafka message key to include (exact string match)
-- `--topic`: topic name (or `KAFKA_TOPIC`)
-- `--brokers`: comma-separated brokers (or `KAFKA_BROKERS`)
-- `--group-id`: consumer group id
-- `--from-beginning`: read from beginning when no committed offset exists
-- `--commit` / `--no-commit`: enable/disable committing offsets (default enabled)
-- `--chunk-size-mb`: chunk size in MB (default `5`)
-- `--output-dir`: base output directory (default `./output`)
-- `--pcm-sample-rate`: input PCM sample rate in Hz (default `48000`)
-- `--pcm-channels`: input PCM channels (default `1`)
+- `--key`: Kafka message key filter (exact match)
+- `--topic` / `--brokers` / `--group-id` / `--from-beginning` / `--commit` or `--no-commit`
+- `--chunk-size-mb`, `--output-dir`, `--pcm-sample-rate`, `--pcm-channels`, `--redis-url`
+- `--delete-after-upload` / `--no-delete-after-upload`: after upload, deletes the local chunk file only (session/user/track dirs stay)
 
-Output path format:
-
-`<output-dir>/<topic>/partition-<n>/chunk-000001.opus`
+Local layout: `<output-dir>/<sessionId>/<userId>/<trackId>/<uuidv7>.opus`.  
+S3 keys: `recordings/<sessionId>/<userId>/<trackId>/<uuidv7>.opus`.
 
 ## Notes
 
-- Offsets are committed only after a message is processed and written.
-- Use `--no-commit` to replay the same data again without advancing offsets.
-- When `--key` is set, non-matching messages are skipped (and committed only if `--commit` is enabled).
-- Payload bytes are validated (`0..255`), and sample alignment is preserved for 32-bit PCM (`s32le`) across packet boundaries.
-- A dedicated consumer group is recommended for partition-focused runs.
-- This is local chunking only; multipart upload can be added next.
+- Upload jobs: **6 attempts**, **5s fixed** BullMQ backoff.
+- Offsets commit after PCM write and enqueue, not after S3/DB complete.
+- `AudioChunksLog.fileS3Key` is **unique**; duplicate inserts after success are ignored in the worker.
+
+## Docker
+
+Build separate images from the **repository root** (both need the full workspace `package-lock.json` and all workspace `package.json` files for `npm ci`):
+
+```bash
+docker build -f Dockerfile.ingest -t cf-ingest .
+docker build -f Dockerfile.merge -t cf-merge .
+```
+
+- **cf-ingest** — runs `node packages/ingest/dist/index.js` (pass ingest flags after the image name).
+- **cf-merge** — runs `node packages/merge/dist/mergeAudioChunks.js` (CLI name `merge-audio-chunks`; pass `--session-id`, `--s3-bucket`, etc.).
+
+Example:
+
+```bash
+docker run --rm -e DATABASE_URL -e REDIS_URL -e S3_BUCKET -e AWS_ACCESS_KEY_ID -e AWS_SECRET_ACCESS_KEY cf-ingest \
+  --topic packets-topic --partition 0 --s3-bucket my-bucket
+
+docker run --rm -e DATABASE_URL -e S3_BUCKET -e AWS_ACCESS_KEY_ID -e AWS_SECRET_ACCESS_KEY cf-merge \
+  --session-id mySession --s3-bucket my-bucket
+```
 
 ## Troubleshooting
 
-- If you request a partition that does not exist, the app now exits with the list of available partitions.
-- If your group has other active consumers, your process may not be assigned the partition you requested; use a dedicated `--group-id`.
-- `--from-beginning` only applies when there are no committed offsets for that group/topic/partition. Use a new `--group-id` to replay full history.
+- Partition / consumer group: use a dedicated `--group-id` if the requested partition is not assigned.
+- Migrations: ensure the host running ingest or merge can reach Postgres with `DATABASE_URL`.
