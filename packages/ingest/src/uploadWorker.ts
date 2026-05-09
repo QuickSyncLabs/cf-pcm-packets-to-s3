@@ -27,7 +27,7 @@ export type UploadWorkerOptions = {
 
 export type UploadWorkerHandle = {
   worker: Worker<UploadJobData>;
-  prisma: PrismaClient;
+  prisma: InstanceType<typeof PrismaClient>;
 };
 
 export function createUploadWorker(opts: UploadWorkerOptions): UploadWorkerHandle {
