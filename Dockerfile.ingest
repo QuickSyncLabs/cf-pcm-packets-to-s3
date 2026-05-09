@@ -31,6 +31,8 @@ RUN apk add --no-cache tini
 WORKDIR /app
 ENV NODE_ENV=production
 COPY --from=prod-deps /app/node_modules ./node_modules
+# prisma generate runs in build stage only — prod-deps uses --ignore-scripts
+COPY --from=build /app/node_modules/.prisma ./node_modules/.prisma
 COPY --from=build /app/packages/db/dist ./packages/db/dist
 COPY --from=build /app/packages/db/prisma ./packages/db/prisma
 COPY --from=build /app/packages/ingest/dist ./packages/ingest/dist
