@@ -39,6 +39,6 @@ COPY --from=build /app/packages/ingest/dist ./packages/ingest/dist
 COPY package.json ./
 COPY packages/db/package.json packages/db/package.json
 COPY packages/ingest/package.json packages/ingest/package.json
-RUN mkdir -p /app/output && chown node:node /app/output
+RUN mkdir -p /app/output && chown -R node:node /app
 USER node
 ENTRYPOINT ["/sbin/tini", "--", "node", "packages/ingest/dist/index.js"]

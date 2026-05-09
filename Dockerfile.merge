@@ -38,6 +38,6 @@ COPY --from=build /app/packages/merge/dist ./packages/merge/dist
 COPY package.json ./
 COPY packages/db/package.json packages/db/package.json
 COPY packages/merge/package.json packages/merge/package.json
-RUN mkdir -p /app/output/tmp && chown -R node:node /app/output
+RUN mkdir -p /app/output/tmp && chown -R node:node /app
 USER node
 ENTRYPOINT ["/sbin/tini", "--", "node", "packages/merge/dist/mergeAudioChunks.js"]
