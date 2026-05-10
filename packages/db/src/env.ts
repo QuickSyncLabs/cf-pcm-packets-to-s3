@@ -7,7 +7,7 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 /**
  * Loads `.env` from the monorepo root (parent of `packages/`), e.g. when
- * `npm run dev -w @cf/ingest` makes cwd `packages/ingest` and the default
+ * `npm run dev -w @cf/ingestor` makes cwd `packages/ingestor` and the default
  * `dotenv/config` would not see repo-root `.env`.
  */
 export function loadMonorepoEnv(): void {

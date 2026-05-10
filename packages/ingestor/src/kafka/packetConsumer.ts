@@ -5,9 +5,9 @@ import { hideBin } from "yargs/helpers";
 import { randomUUID } from "node:crypto";
 import { Queue } from "bullmq";
 import { Redis } from "ioredis";
-import { ChunkWriter, type ChunkResult } from "./chunkWriter.js";
-import { createUploadWorker, type UploadJobData } from "./uploadWorker.js";
-import type { PacketDto } from "./types.js";
+import { ChunkWriter, type ChunkResult } from "../chunk/chunkWriter.js";
+import { createUploadWorker, type UploadJobData } from "../upload/uploadWorker.js";
+import type { PacketDto } from "../types/packet.js";
 import { loadMonorepoEnv, runPrismaMigrateDeploy } from "@cf/db";
 
 loadMonorepoEnv();

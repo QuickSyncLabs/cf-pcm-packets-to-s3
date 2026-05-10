@@ -1,0 +1,28 @@
+{
+  "name": "@cf/recorder",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "merge-audio-chunks": "npm run build -w @cf/db && tsx src/cli/mergeAudioChunks.ts",
+    "recorder": "npm run build -w @cf/db && tsx src/main.ts",
+    "recordings-api": "npm run build -w @cf/db && tsx src/server/recordingsApi.ts",
+    "build": "tsc -p tsconfig.json"
+  },
+  "dependencies": {
+    "@aws-sdk/client-s3": "^3.1040.0",
+    "@cf/db": "*",
+    "amqplib": "^0.10.9",
+    "ffmpeg-static": "^5.3.0",
+    "ffprobe-static": "^3.1.0",
+    "uuid": "^14.0.0",
+    "yargs": "^18.0.0"
+  },
+  "devDependencies": {
+    "@types/amqplib": "^0.10.8",
+    "@types/node": "^25.6.2",
+    "@types/yargs": "^17.0.35",
+    "tsx": "^4.21.0",
+    "typescript": "^5.9.3"
+  }
+}

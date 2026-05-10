@@ -1,16 +1,19 @@
 {
   "name": "cf-packet-to-s3",
   "private": true,
-  "description": "Monorepo: Kafka ingest (compress + upload) and DB-backed session merge (mix)",
+  "description": "Monorepo: Kafka ingestor (compress + upload) and DB-backed session recorder (merge)",
   "workspaces": [
     "packages/*"
   ],
   "scripts": {
     "postinstall": "npm run generate -w @cf/db",
-    "build": "npm run build -w @cf/db && npm run build -w @cf/ingest && npm run build -w @cf/merge",
-    "dev": "npm run dev -w @cf/ingest",
-    "merge-audio-chunks": "npm run merge-audio-chunks -w @cf/merge --",
-    "start": "npm run start -w @cf/ingest"
+    "build": "npm run build -w @cf/db && npm run build -w @cf/ingestor && npm run build -w @cf/recorder",
+    "dev": "npm run dev -w @cf/ingestor",
+    "start": "npm run start -w @cf/ingestor",
+    "ingestor": "npm run dev -w @cf/ingestor",
+    "recorder": "npm run recorder -w @cf/recorder --",
+    "merge-audio-chunks": "npm run merge-audio-chunks -w @cf/recorder --",
+    "recordings-api": "npm run recordings-api -w @cf/recorder"
   },
   "license": "ISC"
 }

@@ -19,3 +19,26 @@ model AudioChunksLog {
   @@index([sessionId, trackId, receivedUnixTimestamp])
   @@map("AudioChunksLog")
 }
+
+enum MergerTaskStatus {
+  IN_PROGRESS
+  COMPLETED
+  FAILED
+}
+
+model MergerTask {
+  id                     Int              @id @default(autoincrement())
+  taskId                 String           @unique
+  sessionId              String
+  status                 MergerTaskStatus
+  outputS3Key            String?
+  createdAt              DateTime         @default(now())
+  endedAt                DateTime?
+  sizeBytes              BigInt?
+  audioDurationInSeconds Float?
+  failureReason          String?
+
+  @@index([sessionId])
+  @@index([status, createdAt])
+  @@map("MergerTasks")
+}
