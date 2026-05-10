@@ -66,6 +66,13 @@ const cli = yargs(hideBin(process.argv))
     default: Number(process.env.CHUNK_SIZE_MB ?? 5),
     describe: "Chunk file size in MB",
   })
+  .option("idle-chunk-flush-ms", {
+    type: "number",
+    demandOption: false,
+    default: Number(process.env.IDLE_CHUNK_FLUSH_MS ?? 10_000),
+    describe:
+      "Flush partial PCM to a chunk after this many ms with no new packets (per session/user/track); env IDLE_CHUNK_FLUSH_MS",
+  })
   .option("output-dir", {
     type: "string",
     demandOption: false,
@@ -159,6 +166,16 @@ async function main(): Promise<void> {
     throw new Error("--chunk-size-mb must be a positive number");
   }
 
+  if (
+    !Number.isInteger(args["idle-chunk-flush-ms"]) ||
+    args["idle-chunk-flush-ms"] <= 0
+  ) {
+    throw new Error(
+      "--idle-chunk-flush-ms (or IDLE_CHUNK_FLUSH_MS) must be a positive integer",
+    );
+  }
+  const idleChunkFlushMs = args["idle-chunk-flush-ms"];
+
   if (!Number.isInteger(args["pcm-sample-rate"]) || args["pcm-sample-rate"] <= 0) {
     throw new Error("--pcm-sample-rate must be a positive integer");
   }
@@ -218,13 +235,37 @@ async function main(): Promise<void> {
   };
 
   const writers = new Map<string, WriterEntry>();
+  const idleChunkFlushTimers = new Map<string, ReturnType<typeof setTimeout>>();
+
+  function writerMapKey(sessionId: string, userId: string, trackId: string): string {
+    return `${sessionId}:${userId}:${trackId}`;
+  }
+
+  function clearIdleChunkFlushTimer(writerKey: string): void {
+    const t = idleChunkFlushTimers.get(writerKey);
+    if (t !== undefined) {
+      clearTimeout(t);
+      idleChunkFlushTimers.delete(writerKey);
+    }
+  }
+
+  function scheduleIdleChunkFlush(writerKey: string, entry: WriterEntry): void {
+    clearIdleChunkFlushTimer(writerKey);
+    const t = setTimeout(() => {
+      idleChunkFlushTimers.delete(writerKey);
+      void entry.writer.forceFlush().catch((err: unknown) => {
+        console.error(`Idle chunk flush failed for ${writerKey}:`, err);
+      });
+    }, idleChunkFlushMs);
+    idleChunkFlushTimers.set(writerKey, t);
+  }
 
   function getOrCreateWriter(
     sessionId: string,
     userId: string,
     trackId: string,
   ): WriterEntry {
-    const writerKey = `${sessionId}:${userId}:${trackId}`;
+    const writerKey = writerMapKey(sessionId, userId, trackId);
     let entry = writers.get(writerKey);
     if (!entry) {
       const writer = new ChunkWriter({
@@ -317,6 +358,10 @@ async function main(): Promise<void> {
 
   const shutdown = async (signal: string): Promise<void> => {
     console.log(`Received ${signal}. Closing consumer, queue, and files...`);
+    for (const t of idleChunkFlushTimers.values()) {
+      clearTimeout(t);
+    }
+    idleChunkFlushTimers.clear();
     try {
       await consumer.disconnect();
     } finally {
@@ -360,6 +405,7 @@ async function main(): Promise<void> {
       `groupId=${args["group-id"]}`,
       `commit=${args.commit ? "on" : "off"}`,
       `chunkSizeMb=${args["chunk-size-mb"]}`,
+      `idleChunkFlushMs=${idleChunkFlushMs}`,
       `pcmFormat=${PCM_SAMPLE_FORMAT}`,
       `pcmSampleRate=${args["pcm-sample-rate"]}`,
       `pcmChannels=${args["pcm-channels"]}`,
@@ -471,6 +517,11 @@ async function main(): Promise<void> {
 
       const unixTimestampMs = parsed.unixTimestamp;
 
+      const wk = writerMapKey(
+        parsedKey.sessionId,
+        parsedKey.userId,
+        parsedKey.trackId,
+      );
       const entry = getOrCreateWriter(
         parsedKey.sessionId,
         parsedKey.userId,
@@ -493,6 +544,7 @@ async function main(): Promise<void> {
 
       if (bytes.length > 0) {
         await entry.writer.write(bytes, unixTimestampMs);
+        scheduleIdleChunkFlush(wk, entry);
       }
 
       await commitProcessedOffset(topic, msgPartition, message.offset);
