@@ -98,8 +98,13 @@ export async function runMergeSession(
       );
     }
 
-    const perUserMixEndOffsetMs = new Map<string, number>();
+    /** Latest mix end (ms from session start) per user — avoids overlapping chunks from the same user across different tracks. */
+    const perUserMixEndMs = new Map<string, number>();
+    /** Latest mix end for each (userId, trackId) — used when the next DB row continues the same lane. */
+    const perLaneMixEndMs = new Map<string, number>();
     const tracks: OpusTrackMs[] = [];
+
+    let prevRow: (typeof rows)[number] | undefined;
 
     for (const row of rows) {
       const rowTs = Number(row.receivedUnixTimestamp);
@@ -110,18 +115,39 @@ export async function runMergeSession(
       }
 
       const idealOffsetMs = rowTs - sessionT0;
-      const userEnd = perUserMixEndOffsetMs.get(row.userId) ?? 0;
-      let delayOffsetMs = Math.max(idealOffsetMs, userEnd);
-      if (delayOffsetMs > idealOffsetMs) {
-        console.log(
-          `userId=${row.userId} row id=${row.id} trackId=${row.trackId}: bump ${idealOffsetMs}ms → ${delayOffsetMs}ms (after this user's prior audio)`,
-        );
+      const laneKey = `${row.userId}\x1e${row.trackId}`;
+      const consecutiveSameLane =
+        prevRow !== undefined &&
+        prevRow.userId === row.userId &&
+        prevRow.trackId === row.trackId;
+
+      let delayOffsetMs: number;
+      if (consecutiveSameLane) {
+        const laneEnd = perLaneMixEndMs.get(laneKey);
+        if (laneEnd === undefined) {
+          throw new Error(
+            `internal: missing lane end for ${row.userId}/${row.trackId} row id=${row.id}`,
+          );
+        }
+        delayOffsetMs = laneEnd;
+      } else {
+        const userEnd = perUserMixEndMs.get(row.userId) ?? 0;
+        delayOffsetMs = Math.max(idealOffsetMs, userEnd);
+        if (delayOffsetMs > idealOffsetMs) {
+          console.log(
+            `userId=${row.userId} row id=${row.id} trackId=${row.trackId}: bump ${idealOffsetMs}ms → ${delayOffsetMs}ms (after this user's prior audio)`,
+          );
+        }
       }
 
       const durationSec = durationByKey.get(row.fileS3Key)!;
       const durationMs = Math.ceil(durationSec * 1000);
       const chunkMixEnd = delayOffsetMs + durationMs;
-      perUserMixEndOffsetMs.set(row.userId, Math.max(userEnd, chunkMixEnd));
+      perLaneMixEndMs.set(laneKey, chunkMixEnd);
+      const userEnd = perUserMixEndMs.get(row.userId) ?? 0;
+      perUserMixEndMs.set(row.userId, Math.max(userEnd, chunkMixEnd));
+
+      prevRow = row;
 
       const safeName = row.fileS3Key.replace(/\//g, "_");
       const absPath = path.join(tempDir, safeName);
