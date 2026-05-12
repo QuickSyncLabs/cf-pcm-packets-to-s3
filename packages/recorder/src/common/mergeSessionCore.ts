@@ -29,6 +29,61 @@ export type RunMergeSessionResult = {
   audioDurationInSeconds: number;
 };
 
+export type MergeChunkRow = {
+  id: number;
+  userId: string;
+  trackId: string;
+  receivedUnixTimestamp: bigint;
+  fileS3Key: string;
+};
+
+export function buildChunkTimelineTracks(
+  rows: MergeChunkRow[],
+  sessionT0: number,
+  durationByKey: Map<string, number>,
+  resolveAbsPath: (fileS3Key: string) => string,
+): OpusTrackMs[] {
+  /** Latest mix end for each (userId, trackId). */
+  const perLaneMixEndMs = new Map<string, number>();
+  const tracks: OpusTrackMs[] = [];
+
+  for (const row of rows) {
+    const rowTs = Number(row.receivedUnixTimestamp);
+    if (!Number.isSafeInteger(rowTs)) {
+      throw new Error(
+        `receivedUnixTimestamp out of safe integer range for row id=${row.id}`,
+      );
+    }
+
+    const idealOffsetMs = rowTs - sessionT0;
+    const laneKey = `${row.userId}\x1e${row.trackId}`;
+    const laneEnd = perLaneMixEndMs.get(laneKey) ?? 0;
+    const delayOffsetMs = Math.max(idealOffsetMs, laneEnd);
+    if (delayOffsetMs > idealOffsetMs) {
+      console.log(
+        `userId=${row.userId} row id=${row.id} trackId=${row.trackId}: bump ${idealOffsetMs}ms → ${delayOffsetMs}ms (after this lane's prior audio)`,
+      );
+    }
+
+    const durationSec = durationByKey.get(row.fileS3Key);
+    if (durationSec === undefined) {
+      throw new Error(`Missing duration for key ${row.fileS3Key}`);
+    }
+    const durationMs = Math.ceil(durationSec * 1000);
+    const chunkMixEnd = delayOffsetMs + durationMs;
+    perLaneMixEndMs.set(laneKey, chunkMixEnd);
+
+    tracks.push({
+      absPath: resolveAbsPath(row.fileS3Key),
+      timestampMs: sessionT0 + delayOffsetMs,
+      fileOrdinal: row.id,
+      durationSec,
+    });
+  }
+
+  return tracks;
+}
+
 async function downloadOpusByKeys(
   s3: S3Client,
   bucket: string,
@@ -69,10 +124,10 @@ export async function runMergeSession(
     s3OutputKey: s3OutKeyOpt,
   } = params;
 
-  const rows = await prisma.audioChunksLog.findMany({
+  const rows = (await prisma.audioChunksLog.findMany({
     where: { sessionId },
     orderBy: [{ receivedUnixTimestamp: "asc" }, { id: "asc" }],
-  });
+  })) as MergeChunkRow[];
 
   if (rows.length === 0) {
     throw new Error(`No AudioChunksLog rows for sessionId=${sessionId}`);
@@ -98,66 +153,16 @@ export async function runMergeSession(
       );
     }
 
-    /** Latest mix end (ms from session start) per user — avoids overlapping chunks from the same user across different tracks. */
-    const perUserMixEndMs = new Map<string, number>();
-    /** Latest mix end for each (userId, trackId) — used when the next DB row continues the same lane. */
-    const perLaneMixEndMs = new Map<string, number>();
-    const tracks: OpusTrackMs[] = [];
-
-    let prevRow: (typeof rows)[number] | undefined;
-
-    for (const row of rows) {
-      const rowTs = Number(row.receivedUnixTimestamp);
-      if (!Number.isSafeInteger(rowTs)) {
-        throw new Error(
-          `receivedUnixTimestamp out of safe integer range for row id=${row.id}`,
-        );
-      }
-
-      const idealOffsetMs = rowTs - sessionT0;
-      const laneKey = `${row.userId}\x1e${row.trackId}`;
-      const consecutiveSameLane =
-        prevRow !== undefined &&
-        prevRow.userId === row.userId &&
-        prevRow.trackId === row.trackId;
-
-      let delayOffsetMs: number;
-      if (consecutiveSameLane) {
-        const laneEnd = perLaneMixEndMs.get(laneKey);
-        if (laneEnd === undefined) {
-          throw new Error(
-            `internal: missing lane end for ${row.userId}/${row.trackId} row id=${row.id}`,
-          );
-        }
-        delayOffsetMs = laneEnd;
-      } else {
-        const userEnd = perUserMixEndMs.get(row.userId) ?? 0;
-        delayOffsetMs = Math.max(idealOffsetMs, userEnd);
-        if (delayOffsetMs > idealOffsetMs) {
-          console.log(
-            `userId=${row.userId} row id=${row.id} trackId=${row.trackId}: bump ${idealOffsetMs}ms → ${delayOffsetMs}ms (after this user's prior audio)`,
-          );
-        }
-      }
-
-      const durationSec = durationByKey.get(row.fileS3Key)!;
-      const durationMs = Math.ceil(durationSec * 1000);
-      const chunkMixEnd = delayOffsetMs + durationMs;
-      perLaneMixEndMs.set(laneKey, chunkMixEnd);
-      const userEnd = perUserMixEndMs.get(row.userId) ?? 0;
-      perUserMixEndMs.set(row.userId, Math.max(userEnd, chunkMixEnd));
-
-      prevRow = row;
-
-      const safeName = row.fileS3Key.replace(/\//g, "_");
-      const absPath = path.join(tempDir, safeName);
-      tracks.push({
-        absPath,
-        timestampMs: sessionT0 + delayOffsetMs,
-        fileOrdinal: row.id,
-        durationSec,
-      });
-    }
+    const resolvedTempDir = tempDir;
+    const tracks = buildChunkTimelineTracks(
+      rows,
+      sessionT0,
+      durationByKey,
+      (fileS3Key) => {
+        const safeName = fileS3Key.replace(/\//g, "_");
+        return path.join(resolvedTempDir, safeName);
+      },
+    );
 
     console.log(`Found ${tracks.length} chunks. sessionT0Ms=${sessionT0}`);
 
