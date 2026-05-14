@@ -7,6 +7,7 @@ import {
   CompleteMultipartUploadCommand,
   AbortMultipartUploadCommand,
   type S3Client,
+  type ObjectCannedACL,
 } from "@aws-sdk/client-s3";
 
 export const MULTIPART_CHUNK_SIZE = 5 * 1024 * 1024;
@@ -31,6 +32,9 @@ export async function multipartUpload(
   bucket: string,
   key: string,
   filePath: string,
+  options?: {
+    acl?: ObjectCannedACL;
+  },
 ): Promise<void> {
   const fileStats = await stat(filePath);
   const fileSize = fileStats.size;
@@ -40,6 +44,7 @@ export async function multipartUpload(
       Bucket: bucket,
       Key: key,
       ContentType: "audio/ogg",
+      ...(options?.acl ? { ACL: options.acl } : {}),
     }),
   );
 

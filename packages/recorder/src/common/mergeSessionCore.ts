@@ -262,7 +262,9 @@ export async function runMergeSession(
       console.log(
         `Uploading merge to s3://${bucket}/${outKey} (multipart ${MULTIPART_CHUNK_SIZE / 1024 / 1024}MB parts)...`,
       );
-      await multipartUpload(s3, bucket, outKey, outputPath);
+      await multipartUpload(s3, bucket, outKey, outputPath, {
+        acl: "public-read",
+      });
       await rm(outputPath, { force: true });
       console.log(`Uploaded s3://${bucket}/${outKey}`);
     }
