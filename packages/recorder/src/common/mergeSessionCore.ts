@@ -34,8 +34,37 @@ export type MergeChunkRow = {
   userId: string;
   trackId: string;
   receivedUnixTimestamp: bigint;
+  firstRtpTimestamp: bigint;
+  lastRtpTimestamp: bigint;
   fileS3Key: string;
 };
+
+const RTP_CLOCK_RATE_HZ = 48_000;
+const RTP_MODULUS = 2 ** 32;
+const RTP_HALF_MODULUS = 2 ** 31;
+
+type LaneTimingState = {
+  laneAnchorOffsetMs: number;
+  laneBaseRtpTimestamp: number;
+  laneEndMs: number;
+};
+
+function parseUnsignedRtpTimestamp(
+  value: bigint,
+  rowId: number,
+  fieldName: "firstRtpTimestamp" | "lastRtpTimestamp",
+): number {
+  const num = Number(value);
+  if (!Number.isInteger(num) || num < 0 || num > 0xffff_ffff) {
+    throw new Error(`${fieldName} out of uint32 range for row id=${rowId}`);
+  }
+  return num;
+}
+
+function signedRtpDelta(current: number, baseline: number): number {
+  const wrapped = ((((current - baseline) % RTP_MODULUS) + RTP_MODULUS) % RTP_MODULUS) as number;
+  return wrapped >= RTP_HALF_MODULUS ? wrapped - RTP_MODULUS : wrapped;
+}
 
 export function buildChunkTimelineTracks(
   rows: MergeChunkRow[],
@@ -43,8 +72,8 @@ export function buildChunkTimelineTracks(
   durationByKey: Map<string, number>,
   resolveAbsPath: (fileS3Key: string) => string,
 ): OpusTrackMs[] {
-  /** Latest mix end for each (userId, trackId). */
-  const perLaneMixEndMs = new Map<string, number>();
+  /** Timing state for each (userId, trackId) lane. */
+  const perLaneTiming = new Map<string, LaneTimingState>();
   const tracks: OpusTrackMs[] = [];
 
   for (const row of rows) {
@@ -55,9 +84,29 @@ export function buildChunkTimelineTracks(
       );
     }
 
-    const idealOffsetMs = rowTs - sessionT0;
+    const firstRtpTimestamp = parseUnsignedRtpTimestamp(
+      row.firstRtpTimestamp,
+      row.id,
+      "firstRtpTimestamp",
+    );
+    const lastRtpTimestamp = parseUnsignedRtpTimestamp(
+      row.lastRtpTimestamp,
+      row.id,
+      "lastRtpTimestamp",
+    );
+    const chunkRtpSpan = signedRtpDelta(lastRtpTimestamp, firstRtpTimestamp);
+    if (chunkRtpSpan < 0) {
+      throw new Error(`lastRtpTimestamp precedes firstRtpTimestamp for row id=${row.id}`);
+    }
+
     const laneKey = `${row.userId}\x1e${row.trackId}`;
-    const laneEnd = perLaneMixEndMs.get(laneKey) ?? 0;
+    const laneState = perLaneTiming.get(laneKey);
+    const laneAnchorOffsetMs = laneState?.laneAnchorOffsetMs ?? rowTs - sessionT0;
+    const laneBaseRtpTimestamp = laneState?.laneBaseRtpTimestamp ?? firstRtpTimestamp;
+    const laneEnd = laneState?.laneEndMs ?? 0;
+    const laneRtpDeltaTicks = signedRtpDelta(firstRtpTimestamp, laneBaseRtpTimestamp);
+    const laneRtpDeltaMs = (laneRtpDeltaTicks * 1000) / RTP_CLOCK_RATE_HZ;
+    const idealOffsetMs = laneAnchorOffsetMs + laneRtpDeltaMs;
     const delayOffsetMs = Math.max(idealOffsetMs, laneEnd);
     if (delayOffsetMs > idealOffsetMs) {
       console.log(
@@ -71,7 +120,11 @@ export function buildChunkTimelineTracks(
     }
     const durationMs = Math.ceil(durationSec * 1000);
     const chunkMixEnd = delayOffsetMs + durationMs;
-    perLaneMixEndMs.set(laneKey, chunkMixEnd);
+    perLaneTiming.set(laneKey, {
+      laneAnchorOffsetMs,
+      laneBaseRtpTimestamp,
+      laneEndMs: chunkMixEnd,
+    });
 
     tracks.push({
       absPath: resolveAbsPath(row.fileS3Key),

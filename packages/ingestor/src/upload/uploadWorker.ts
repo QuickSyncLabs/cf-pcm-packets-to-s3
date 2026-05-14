@@ -11,6 +11,8 @@ export type UploadJobData = {
   userId: string;
   trackId: string;
   anchorUnixTimestampMs: number;
+  firstRtpTimestamp: number;
+  lastRtpTimestamp: number;
 };
 
 export type UploadWorkerOptions = {
@@ -48,8 +50,16 @@ export function createUploadWorker(opts: UploadWorkerOptions): UploadWorkerHandl
   const worker = new Worker<UploadJobData>(
     opts.queueName,
     async (job: Job<UploadJobData>) => {
-      const { localPath, s3Key, sessionId, userId, trackId, anchorUnixTimestampMs } =
-        job.data;
+      const {
+        localPath,
+        s3Key,
+        sessionId,
+        userId,
+        trackId,
+        anchorUnixTimestampMs,
+        firstRtpTimestamp,
+        lastRtpTimestamp,
+      } = job.data;
 
       const body = await readFile(localPath);
 
@@ -71,6 +81,8 @@ export function createUploadWorker(opts: UploadWorkerOptions): UploadWorkerHandl
             userId,
             trackId,
             receivedUnixTimestamp: BigInt(anchorUnixTimestampMs),
+            firstRtpTimestamp: BigInt(firstRtpTimestamp),
+            lastRtpTimestamp: BigInt(lastRtpTimestamp),
             fileS3Key: s3Key,
           },
         });

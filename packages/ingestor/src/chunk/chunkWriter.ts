@@ -8,6 +8,8 @@ export type ChunkResult = {
   localPath: string;
   s3Key: string;
   anchorUnixTimestampMs: number;
+  firstRtpTimestamp: number;
+  lastRtpTimestamp: number;
 };
 
 export type ChunkWriterOptions = {
@@ -34,6 +36,8 @@ export class ChunkWriter {
   private readonly onChunkReady?: (result: ChunkResult) => void;
   private currentChunk = Buffer.alloc(0);
   private currentChunkLabelTimestamp: number | null = null;
+  private currentChunkFirstRtpTimestamp: number | null = null;
+  private currentChunkLastRtpTimestamp: number | null = null;
   private pendingWrite = Promise.resolve();
 
   constructor(opts: ChunkWriterOptions) {
@@ -60,7 +64,11 @@ export class ChunkWriter {
     mkdirSync(this.localDir, { recursive: true });
   }
 
-  write(buffer: Buffer, packetTimestampMs: number): Promise<void> {
+  write(
+    buffer: Buffer,
+    packetTimestampMs: number,
+    packetRtpTimestamp: number,
+  ): Promise<void> {
     if (buffer.length === 0) {
       return this.pendingWrite;
     }
@@ -70,6 +78,7 @@ export class ChunkWriter {
       while (cursor < buffer.length) {
         if (this.currentChunk.length === 0) {
           this.currentChunkLabelTimestamp = packetTimestampMs;
+          this.currentChunkFirstRtpTimestamp = packetRtpTimestamp;
         }
 
         const remainingInChunk = this.chunkSizeBytes - this.currentChunk.length;
@@ -77,6 +86,7 @@ export class ChunkWriter {
         const bytesToWrite = Math.min(remainingInChunk, remainingInBuffer);
         const slice = buffer.subarray(cursor, cursor + bytesToWrite);
         this.currentChunk = Buffer.concat([this.currentChunk, slice]);
+        this.currentChunkLastRtpTimestamp = packetRtpTimestamp;
         cursor += bytesToWrite;
 
         if (this.currentChunk.length >= this.chunkSizeBytes) {
@@ -109,11 +119,21 @@ export class ChunkWriter {
     this.currentChunk = Buffer.alloc(0);
 
     if (this.currentChunkLabelTimestamp === null) {
-      throw new Error("internal: chunk flush without packet.timestamp");
+      throw new Error("internal: chunk flush without chunk anchor timestamp");
+    }
+    if (this.currentChunkFirstRtpTimestamp === null) {
+      throw new Error("internal: chunk flush without first RTP timestamp");
+    }
+    if (this.currentChunkLastRtpTimestamp === null) {
+      throw new Error("internal: chunk flush without last RTP timestamp");
     }
 
     const anchorUnixTimestampMs = this.currentChunkLabelTimestamp;
+    const firstRtpTimestamp = this.currentChunkFirstRtpTimestamp;
+    const lastRtpTimestamp = this.currentChunkLastRtpTimestamp;
     this.currentChunkLabelTimestamp = null;
+    this.currentChunkFirstRtpTimestamp = null;
+    this.currentChunkLastRtpTimestamp = null;
 
     const { v7: uuidv7 } = await import("uuid");
     const fileName = `${uuidv7()}.${this.fileExtension}`;
@@ -128,6 +148,8 @@ export class ChunkWriter {
       localPath,
       s3Key,
       anchorUnixTimestampMs,
+      firstRtpTimestamp,
+      lastRtpTimestamp,
     });
   }
 

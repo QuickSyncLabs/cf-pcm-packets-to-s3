@@ -286,6 +286,8 @@ async function main(): Promise<void> {
             userId,
             trackId,
             anchorUnixTimestampMs: result.anchorUnixTimestampMs,
+            firstRtpTimestamp: result.firstRtpTimestamp,
+            lastRtpTimestamp: result.lastRtpTimestamp,
           });
         },
       });
@@ -516,6 +518,18 @@ async function main(): Promise<void> {
       }
 
       const unixTimestampMs = parsed.unixTimestamp;
+      const packetRtpTimestamp = parsed.packet?.timestamp;
+      if (
+        !Number.isInteger(packetRtpTimestamp) ||
+        packetRtpTimestamp < 0 ||
+        packetRtpTimestamp > 0xffff_ffff
+      ) {
+        console.warn(
+          `Skipping message at offset ${message.offset}: packet.timestamp missing or out of unsigned 32-bit range`,
+        );
+        await commitProcessedOffset(topic, msgPartition, message.offset);
+        return;
+      }
 
       const wk = writerMapKey(
         parsedKey.sessionId,
@@ -543,7 +557,7 @@ async function main(): Promise<void> {
       }
 
       if (bytes.length > 0) {
-        await entry.writer.write(bytes, unixTimestampMs);
+        await entry.writer.write(bytes, unixTimestampMs, packetRtpTimestamp);
         scheduleIdleChunkFlush(wk, entry);
       }
 

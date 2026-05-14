@@ -13,6 +13,8 @@ model AudioChunksLog {
   userId                 String @map("userId")
   trackId                String @map("trackId")
   receivedUnixTimestamp  BigInt @map("receivedUnixTimestamp")
+  firstRtpTimestamp      BigInt @map("firstRtpTimestamp")
+  lastRtpTimestamp       BigInt @map("lastRtpTimestamp")
   fileS3Key              String @unique @map("fileS3Key")
 
   @@index([sessionId, receivedUnixTimestamp])
