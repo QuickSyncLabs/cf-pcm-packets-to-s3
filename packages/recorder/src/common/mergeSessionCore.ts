@@ -96,7 +96,10 @@ export function buildChunkTimelineTracks(
     );
     const chunkRtpSpan = signedRtpDelta(lastRtpTimestamp, firstRtpTimestamp);
     if (chunkRtpSpan < 0) {
-      throw new Error(`lastRtpTimestamp precedes firstRtpTimestamp for row id=${row.id}`);
+      console.warn(
+        `Skipping chunk row id=${row.id} userId=${row.userId} trackId=${row.trackId}: lastRtpTimestamp (${lastRtpTimestamp}) precedes firstRtpTimestamp (${firstRtpTimestamp}); key=${row.fileS3Key}`,
+      );
+      continue;
     }
 
     const laneKey = `${row.userId}\x1e${row.trackId}`;
